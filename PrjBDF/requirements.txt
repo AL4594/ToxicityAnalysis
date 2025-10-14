@@ -1,0 +1,17 @@
+# Producers
+tweepy
+praw
+snscrape
+kafka-python
+requests
+
+# Spark Streaming
+pyspark
+pandas
+numpy
+vaderSentiment
+pymongo
+
+# Dashboard (optionnel)
+streamlit
+plotly
