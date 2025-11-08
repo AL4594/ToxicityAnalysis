@@ -1,0 +1,3 @@
+praw
+kafka-python-ng
+google-api-python-client
