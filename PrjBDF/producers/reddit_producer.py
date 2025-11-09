@@ -4,7 +4,6 @@ import json
 import time
 import sys
 
-# --- Configuration Reddit ---
 
 reddit = praw.Reddit(
     client_id='tktc8C-bBDvIMTUW2YHiHw',
@@ -13,11 +12,11 @@ reddit = praw.Reddit(
 )
 print("Connecté à l'API Reddit")
 
-# --- Configuration Kafka ---
-KAFKA_TOPIC = "raw_reddit_comments"
-KAFKA_SERVER = "kafka:29092" # Nom du service dans docker-compose
 
-# --- Liste des Subreddits ---
+KAFKA_TOPIC = "raw_reddit_comments"
+KAFKA_SERVER = "kafka:29092" 
+
+
 SUBREDDIT_LIST = [
     "news", "worldnews", "politics", "technology", "gaming", "movies", "science",
     "todayilearned", "aww", "funny", "pics", "videos", "AskReddit", "IAmA",
@@ -28,7 +27,6 @@ SUBREDDIT_LIST = [
     "cscareerquestions", "linux", "sysadmin", "devops", "kubernetes", "docker",
     "formula1", "soccer", "nba", "nfl", "leagueoflegends", "Minecraft"
 ]
-# Combinez les subreddits en une seule chaîne pour le streaming
 subreddit_string = "+".join(SUBREDDIT_LIST)
 
 try:
@@ -46,18 +44,23 @@ try:
     subreddit = reddit.subreddit(subreddit_string)
     for comment in subreddit.stream.comments(skip_existing=True):
         try:
+            
             data = {
                 "id": comment.id,
                 "source": "reddit",
                 "text_content": comment.body,
                 "timestamp": int(comment.created_utc),
                 "author": comment.author.name if comment.author else "unknown",
-                "subreddit": comment.subreddit.display_name,
-                "post_id": comment.link_id,
-                "post_title": comment.submission.title
+                
+                
+                "metadata": {
+                    "source_specific_id": comment.subreddit.display_name, 
+                    "post_id": comment.link_id,
+                    "post_title": comment.submission.title
+                }
             }
             
-            print(f"[REDDIT] -> {data['subreddit']}: {data['text_content'][:50]}...")
+            print(f"[REDDIT] -> {data['metadata']['source_specific_id']}: {data['text_content'][:50]}...")
             producer.send(KAFKA_TOPIC, value=data)
             
         except Exception as e:

@@ -1,18 +1,16 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, current_timestamp
-from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType, MapType
+from pyspark.sql.functions import from_json, col, current_timestamp, pandas_udf
+from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType, MapType, FloatType
+import pandas as pd
 
-# Configuration des applications Spark et des librairies
-# Remarque : Les librairies 'spark-sql-kafka-0-10' et 'mongo-spark-connector'
-# doivent être spécifiées dans le script de lancement (spark-submit)
-# pour que cela fonctionne dans un environnement Docker.
+
 SPARK_APP_NAME = "SocialMediaToxicityProcessor"
 KAFKA_SERVER = "kafka:29092"
-KAFKA_TOPICS = "raw_reddit_comments,raw_youtube_comments" # Listen to both topics
+KAFKA_TOPICS = "raw_reddit_comments,raw_youtube_comments" 
 MONGO_OUTPUT_URI = "mongodb://mongo:27017/toxicity_db.raw_comments"
-CHECKPOINT_LOCATION = "/tmp/spark_checkpoint/toxicity_processor_v2" # Mise à jour du checkpoint pour les nouveaux topics
+CHECKPOINT_LOCATION = "/tmp/spark_checkpoint/toxicity_processor_v2" 
 
-# 1. Initialisation de la session Spark
+
 spark = SparkSession \
     .builder \
     .appName(SPARK_APP_NAME) \
@@ -22,27 +20,47 @@ spark = SparkSession \
 spark.sparkContext.setLogLevel("ERROR")
 print("Spark Session Initialized.")
 
-# Schéma de décodage du message Kafka (clé, valeur, etc.)
-kafka_schema = StructType([
-    StructField("key", StringType(), True),
-    StructField("value", StringType(), True),
-    StructField("topic", StringType(), True),
-    StructField("timestamp", TimestampType(), True) # Timestamp Kafka
-])
 
-# Schéma des données internes (harmonisé pour Reddit, YouTube, Threads)
-# Note: Nous utilisons LongType pour le timestamp UNIX brut
 data_schema = StructType([
     StructField("id", StringType(), True),
     StructField("source", StringType(), True),
     StructField("text_content", StringType(), True),
-    StructField("timestamp", LongType(), True), # Timestamp UNIX (secondes)
+    StructField("timestamp", LongType(), True), 
     StructField("author", StringType(), True),
-    # Le MapType gère l'objet imbriqué 'metadata' sans avoir besoin de définir tous ses sous-champs
     StructField("metadata", MapType(StringType(), StringType()), True) 
 ])
 
-# 2. Lecture en Streaming depuis Kafka
+
+
+@pandas_udf(FloatType())
+def analyze_toxicity(texts: pd.Series) -> pd.Series:
+    """
+    Applique un modèle de toxicité à un lot de textes (Pandas Series).
+    """
+    from transformers import pipeline
+    
+    
+    toxicity_classifier = pipeline(
+        "text-classification",
+        model="unitary/toxic-bert", 
+        framework="pt",
+        device=-1 
+    )
+
+    results = toxicity_classifier(texts.tolist(), truncation=True, max_length=512, batch_size=16)
+    
+    def get_score(res):
+        try:
+            
+            if res['label'].lower() == 'toxic' or res['label'] == 'LABEL_1':
+                return float(res['score'])
+            return float(1.0 - res['score']) 
+        except:
+            return 0.0 
+
+    return pd.Series([get_score(r) for r in results])
+
+
 kafka_stream = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", KAFKA_SERVER) \
@@ -50,49 +68,54 @@ kafka_stream = spark.readStream \
     .option("startingOffsets", "latest") \
     .load()
 
-# 3. Transformation des données
+
 data_df = kafka_stream \
     .select(from_json(col("value").cast("string"), data_schema).alias("data")) \
     .select("data.*")
 
-# Harmonisation et conversions:
-# a) Conversion du timestamp UNIX (secondes) en Spark/Mongo Timestamp (ISODate)
-# b) Renommage de 'id' en '_id' pour la clé primaire MongoDB
-# c) Ajout d'une colonne de traitement (optional)
+
 processed_df = data_df.withColumn(
     "timestamp",
-    col("timestamp").cast(TimestampType()) # Convertit Long (secondes) en Timestamp pour MongoDB
+    col("timestamp").cast(TimestampType()) 
 ).withColumnRenamed(
     "id", "_id"
 )
 
-# Affichage du schéma et du stream pour le debug
-print("Schéma du DataFrame traité:")
-processed_df.printSchema()
 
-# 4. Fonction d'écriture par lot (pour Stuctured Streaming)
 def foreach_batch_function(df, batchId):
     """Logique à exécuter pour chaque micro-lot de données."""
     if df.count() > 0:
         print(f"--- Démarrage du Traitement du Lot {batchId}. Taille: {df.count()} ---")
         
-        # 5. Écriture dans MongoDB
-        try:
-            df.write \
-                .format("mongo") \
-                .mode("append") \
-                .option("uri", MONGO_OUTPUT_URI) \
-                .option("spark.mongodb.output.writeConcern.w", "majority") \
-                .option("spark.mongodb.output.upsertDocument", "true") \
-                .save()
-            print(f"Lot {batchId} écrit avec succès dans MongoDB (collection raw_comments).")
-        except Exception as e:
-            print(f"Erreur d'écriture MongoDB pour le lot {batchId}: {e}")
+        df_analyzed = df \
+            .filter(col("text_content").isNotNull() & (col("text_content") != "")) \
+            .withColumn("toxicity_score", analyze_toxicity(col("text_content")))
+        
+        if df_analyzed.count() > 0:
+            try:
+                df_analyzed.write \
+                    .format("mongo") \
+                    .mode("append") \
+                    .option("uri", MONGO_OUTPUT_URI) \
+                    .option("spark.mongodb.output.writeConcern.w", "majority") \
+                    .save()
+                print(f"Lot {batchId} analysé et écrit avec succès dans MongoDB.")
+            except Exception as e:
+                print(f"Erreur d'écriture MongoDB pour le lot {batchId}: {e}")
+                
+                print("--- TRACE D'ERREUR PYTHON DU WORKER ---")
+                
+                if hasattr(e, 'cause') and e.cause is not None:
+                    print(e.cause)
+                print("-------------------------------------")
+        else:
+            print(f"Lot {batchId} ne contenait aucun texte valide après filtrage.")
+            
     else:
         print(f"Lot {batchId} vide.")
 
 
-# 6. Démarrage du stream d'écriture
+
 query = processed_df.writeStream \
     .foreachBatch(foreach_batch_function) \
     .outputMode("append") \
@@ -102,5 +125,5 @@ query = processed_df.writeStream \
 
 print("Spark Streaming Query Started. Listening to Kafka topics...")
 
-# 7. Attente de la fin du traitement (ctrl-C pour arrêter)
+
 query.awaitTermination()

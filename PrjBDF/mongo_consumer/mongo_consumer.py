@@ -4,7 +4,7 @@ import json
 import time
 import sys
 
-# --- Configuration ---
+
 KAFKA_SERVER = "kafka:29092"
 KAFKA_TOPIC = "analyzed_comments"
 MONGO_SERVER = "mongo:27017"
@@ -13,7 +13,6 @@ MONGO_COLLECTION = "comments"
 
 print("Démarrage du consommateur Mongo...")
 
-# Attendre que Kafka et Mongo soient prêts
 time.sleep(30) 
 
 try:
@@ -33,7 +32,7 @@ try:
     client = MongoClient(f"mongodb://{MONGO_SERVER}/")
     db = client[MONGO_DB]
     collection = db[MONGO_COLLECTION]
-    # Créer un index pour accélérer les requêtes du dashboard
+    
     collection.create_index([("toxicity_score", -1)])
     collection.create_index([("source", 1)])
     collection.create_index([("timestamp", -1)])
@@ -47,7 +46,7 @@ try:
     for message in consumer:
         data = message.value
         try:
-            # Insérer le document dans MongoDB
+            
             collection.insert_one(data)
             print(f"MONGO INSERT -> Score: {data.get('toxicity_score', 'N/A')}, Source: {data.get('source_name', 'N/A')[:20]}...")
         except Exception as e:

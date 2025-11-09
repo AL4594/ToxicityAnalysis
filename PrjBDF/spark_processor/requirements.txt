@@ -1,2 +1,6 @@
 pyspark==3.5.0
-kafka-python-ng 
+kafka-python-ng
+transformers
+torch
+pandas
+pyarrow
