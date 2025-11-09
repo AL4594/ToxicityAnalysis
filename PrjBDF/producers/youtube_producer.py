@@ -7,29 +7,34 @@ import random
 
 # --- Configuration YouTube (Utilisez votre clé !) ---
 # !! ATTENTION : NE PAS EXPOSER CETTE CLÉ PUBLIQUEMENT !!
-API_KEY = "AIzaSyDy4FsuW09beKfCqv8oPtAeCdRCDsOPibE"
-SEARCH_QUERIES = ["débat politique", "actualités", "gaming review", "tech explained"]
-MAX_VIDEOS_PER_QUERY = 2 # Limite pour ne pas épuiser le quota
+# REMPLACEZ CE JETON PAR VOTRE VRAIE CLÉ API GOOGLE
+API_KEY = "AIzaSyBV_GSOqhCig17cgXwNFoEM0GGF9RU4nWM" # <-- CLÉ API GOOGLE CLOUD
+SEARCH_QUERIES = ["débat politique", "actualités", "gaming review", "tech explained", "intelligence artificielle", "cuisine rapide"]
+MAX_VIDEOS_PER_QUERY = 3 # Limite pour ne pas épuiser le quota
 MAX_COMMENTS_PER_VIDEO = 5 # Limite pour ne pas épuiser le quota
 
 # --- Configuration Kafka ---
 KAFKA_TOPIC = "raw_youtube_comments"
 KAFKA_SERVER = "kafka:29092"
 
+# Initialisation
 try:
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_SERVER,
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
     )
-    youtube = build('youtube', 'v3', developerKey=API_KEY)
+    # Utilisation de la clé définie en haut du script
+    youtube = build('youtube', 'v3', developerKey=API_KEY) 
     print("Connecté à Kafka et à l'API YouTube")
 except Exception as e:
-    print(f"Erreur de connexion: {e}")
+    # Affiche un message d'erreur si la clé n'est pas valide ou la connexion échoue
+    print(f"Erreur de connexion: {e}") 
     sys.exit(1)
 
 seen_comment_ids = set()
 
 def get_video_comments(video_id, video_title):
+    """Récupère les commentaires pour une vidéo donnée et les envoie à Kafka."""
     try:
         request = youtube.commentThreads().list(
             part="snippet",
@@ -40,22 +45,28 @@ def get_video_comments(video_id, video_title):
         response = request.execute()
 
         for item in response.get("items", []):
-            comment = item["snippet"]["topLevelComment"]["snippet"]
+            comment_snippet = item["snippet"]["topLevelComment"]["snippet"]
             comment_id = item["snippet"]["topLevelComment"]["id"]
             
             if comment_id not in seen_comment_ids:
-                data = {
+                # Harmonisation des données au format MongoDB compatible
+                harmonized_data = {
                     "id": comment_id,
                     "source": "youtube",
-                    "text_content": comment["textDisplay"],
-                    "timestamp": int(time.mktime(time.strptime(comment["publishedAt"], "%Y-%m-%dT%H:%M:%SZ"))),
-                    "author": comment.get("authorDisplayName", "unknown"),
-                    "video_id": video_id,
-                    "video_title": video_title
+                    "text_content": comment_snippet["textDisplay"],
+                    # Conversion du format de date ISO en timestamp UNIX (secondes)
+                    "timestamp": int(time.mktime(time.strptime(comment_snippet["publishedAt"], "%Y-%m-%dT%H:%M:%SZ"))),
+                    "author": comment_snippet.get("authorDisplayName", "unknown"),
+                    # NOUVEAU: Imbrication des métadonnées comme dans le schéma MongoDB
+                    "metadata": {
+                        "source_specific_id": "youtube", 
+                        "post_id": video_id,        # L'ID du post est l'ID de la vidéo
+                        "post_title": video_title # Le titre du post est le titre de la vidéo
+                    }
                 }
                 
-                print(f"[YOUTUBE] -> {data['video_title'][:20]}...: {data['text_content'][:50]}...")
-                producer.send(KAFKA_TOPIC, value=data)
+                print(f"[YOUTUBE] -> {harmonized_data['metadata']['post_title'][:20]}...: {harmonized_data['text_content'][:50]}...")
+                producer.send(KAFKA_TOPIC, value=harmonized_data)
                 seen_comment_ids.add(comment_id)
                 
     except Exception as e:
@@ -65,7 +76,9 @@ def get_video_comments(video_id, video_title):
             print(f"Erreur API YouTube (get_video_comments): {e}")
 
 def search_videos():
+    """Recherche des vidéos basées sur des requêtes aléatoires."""
     query = random.choice(SEARCH_QUERIES)
+    print(f"\n--- Nouvelle recherche YouTube: '{query}' ---")
     try:
         request = youtube.search().list(
             part="snippet",

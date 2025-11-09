@@ -1,5 +1,5 @@
 # Utilise une image Python légère
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 # Met à jour pip et installe les packages requis
 WORKDIR /app

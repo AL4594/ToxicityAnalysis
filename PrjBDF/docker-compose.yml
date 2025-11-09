@@ -73,6 +73,15 @@ services:
     networks:
       - default
 
+  youtube-producer:
+    build: ./producers
+    container_name: youtube-producer
+    command: /bin/bash -c "sleep 15 && python youtube_producer.py"
+    depends_on:
+      - kafka
+    networks:
+      - default
+
   spark-processor:
     build: ./spark_processor
     container_name: spark-processor
