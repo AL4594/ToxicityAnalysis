@@ -1,128 +1,98 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, udf, lit, struct, to_json, expr
-from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType
-from transformers import pipeline
-import time
+from pyspark.sql.functions import col, from_json, struct, current_timestamp, when, lit
+from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType
 
-# --- Configuration ---
-KAFKA_SERVER = "kafka:29092"
-RAW_REDDIT_TOPIC = "raw_reddit_comments"
-RAW_YOUTUBE_TOPIC = "raw_youtube_comments"
-ANALYZED_TOPIC = "analyzed_comments"
-SPARK_MASTER = "spark://spark-master:7077"
+# --- Initialisation Spark Session ---
+# Les packages sont inclus via le docker-compose
+spark = SparkSession \
+    .builder \
+    .appName("ToxicityStreamProcessorRedditOnly") \
+    .getOrCreate()
 
-# --- Initialisation du modèle ML ---
-# Utilisation d'un modèle plus léger pour l'inférence rapide
-# Vous pouvez choisir un modèle de toxicité plus performant
-# ex: "martin-ha/toxic-comment-model" ou "unitary/toxic-bert"
-# Pour le français: "cmarkea/distilcamembert-base-sentiment"
-print("Chargement du modèle de sentiment...")
-# Ce modèle classe comme 'positive', 'negative', 'neutral'. 
-# Nous allons mapper 'negative' comme 'toxique' pour simplifier.
-sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-eng")
-print("Modèle chargé.")
+spark.sparkContext.setLogLevel("WARN")
+print("Spark Session démarrée (Mode Reddit Uniquement).")
 
-def predict_toxicity(text):
-    """
-    UDF pour prédire la toxicité.
-    Nous utilisons un modèle de sentiment et mappons NEGATIVE à un score de toxicité élevé.
-    """
-    if not text:
-        return 0.0
-    try:
-        # Limiter la longueur du texte pour l'inférence
-        result = sentiment_pipeline(text[:512])[0]
-        if result['label'] == 'NEGATIVE':
-            return float(result['score']) # Score de "négativité"
-        else:
-            return 1.0 - float(result['score']) # Score de "non-négativité"
-    except Exception as e:
-        print(f"Erreur d'inférence: {e}")
-        return 0.0
-
-# Enregistrer l'UDF
-toxicity_udf = udf(predict_toxicity, StringType())
-
-# --- Schémas des données Kafka ---
-reddit_schema = StructType([
+# --- Schéma des données entrantes de Kafka (issu de reddit_producer.py) ---
+# Nous incluons uniquement les champs que nous recevons de Reddit
+base_schema = StructType([
     StructField("id", StringType(), True),
-    StructField("source", StringType(), True),
+    StructField("source", StringType(), True), # Sera toujours "reddit"
     StructField("text_content", StringType(), True),
     StructField("timestamp", LongType(), True),
     StructField("author", StringType(), True),
     StructField("subreddit", StringType(), True),
+    StructField("post_id", StringType(), True),
     StructField("post_title", StringType(), True)
 ])
 
-youtube_schema = StructType([
-    StructField("id", StringType(), True),
-    StructField("source", StringType(), True),
-    StructField("text_content", StringType(), True),
-    StructField("timestamp", LongType(), True),
-    StructField("author", StringType(), True),
-    StructField("video_id", StringType(), True),
-    StructField("video_title", StringType(), True)
-])
+# --- Fonction de traitement par lot (Écriture dans Mongo) ---
+def process_stream_and_store(df, batchId):
+    """Consomme les données de Kafka, les harmonise et les stocke dans Mongo."""
+    print(f"--- Traitement du lot {batchId} ({df.count()} lignes) ---")
+    
+    if df.count() == 0:
+        print("Lot vide. Saut.")
+        return
+    
+    # 1. Désérialisation du JSON
+    value_df = df.select(
+        from_json(col("value").cast("string"), base_schema).alias("data")
+    ).select("data.*")
 
-# --- Initialisation Spark ---
-spark = SparkSession.builder \
-    .appName("ToxicityAnalysis") \
-    .master(SPARK_MASTER) \
-    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0") \
-    .getOrCreate()
+    # 2. Harmonisation de la structure pour MongoDB (Simplifié pour Reddit)
+    processed_df = value_df \
+        .withColumn("_id", col("id")) \
+        .withColumn("ingestion_time", current_timestamp()) \
+        .withColumn("timestamp_utc", col("timestamp").cast(TimestampType())) \
+        .withColumn(
+            "metadata", 
+            # On crée un objet metadata spécifique à Reddit
+            struct(
+                col("subreddit").alias("source_specific_id"), 
+                col("post_id"), 
+                col("post_title")
+            )
+        ) \
+        .select(
+            col("_id"), 
+            col("source"), 
+            col("text_content"), 
+            col("timestamp_utc").alias("timestamp"), 
+            col("author"), 
+            col("metadata"), 
+            col("ingestion_time")
+        )
+    
+    # 3. Écriture dans MongoDB
+    MONGO_OUTPUT_URI = "mongodb://mongo:27017/toxicity_db.raw_comments"
+    
+    try:
+        processed_df.write \
+            .format("mongo") \
+            .mode("append") \
+            .option("uri", MONGO_OUTPUT_URI) \
+            .save()
+        print(f"Lot {batchId} écrit avec succès dans MongoDB (collection raw_comments).")
+    except Exception as e:
+        print(f"Erreur d'écriture MongoDB pour le lot {batchId}: {e}")
 
-spark.sparkContext.setLogLevel("WARN")
-print("Session Spark créée.")
+# --- Démarrage du Spark Streaming pour le topic Reddit uniquement ---
+KAFKA_REDDIT_TOPIC = "raw_reddit_comments" # Changement ici
 
-# --- Lecture des flux Kafka ---
-df_reddit = spark.readStream \
+# Configuration du streaming Kafka pour le topic Reddit
+kafka_stream_df = spark \
+    .readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", KAFKA_SERVER) \
-    .option("subscribe", RAW_REDDIT_TOPIC) \
-    .load() \
-    .select(from_json(col("value").cast("string"), reddit_schema).alias("data")) \
-    .select("data.*") \
-    .withColumn("source_name", col("subreddit")) # Pour l'agrégation
+    .option("kafka.bootstrap.servers", "kafka:29092") \
+    .option("subscribe", KAFKA_REDDIT_TOPIC) \
+    .option("startingOffsets", "earliest") \
+    .load()
 
-df_youtube = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", KAFKA_SERVER) \
-    .option("subscribe", RAW_YOUTUBE_TOPIC) \
-    .load() \
-    .select(from_json(col("value").cast("string"), youtube_schema).alias("data")) \
-    .select("data.*") \
-    .withColumn("source_name", col("video_title")) # Pour l'agrégation
-
-# --- Union des deux flux ---
-df_combined = df_reddit.select("id", "source", "text_content", "timestamp", "author", "source_name") \
-    .union(
-        df_youtube.select("id", "source", "text_content", "timestamp", "author", "source_name")
-    )
-
-# --- Application du modèle ML ---
-df_analyzed = df_combined \
-    .withColumn("toxicity_score", toxicity_udf(col("text_content")).cast("float")) \
-    .withColumn("processing_timestamp", lit(int(time.time())))
-
-# --- Envoi des résultats vers Kafka (pour le consommateur Mongo) ---
-# Nous transformons notre DataFrame en une seule colonne "value" au format JSON
-query_kafka = df_analyzed \
-    .select(to_json(struct("*")).alias("value")) \
+# Lancer la requête de streaming
+query = kafka_stream_df \
     .writeStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", KAFKA_SERVER) \
-    .option("topic", ANALYZED_TOPIC) \
-    .option("checkpointLocation", "/tmp/checkpoints/kafka_writer") \
+    .foreachBatch(process_stream_and_store) \
+    .option("checkpointLocation", "/tmp/spark_checkpoint/toxicity_processor_reddit") \
     .start()
 
-# --- Requête de débogage (optionnel) ---
-query_console = df_analyzed \
-    .writeStream \
-    .outputMode("append") \
-    .format("console") \
-    .option("truncate", "true") \
-    .start()
-
-print("Streams démarrés. En attente de données...")
-query_kafka.awaitTermination()
-query_console.awaitTermination()
+query.awaitTermination()

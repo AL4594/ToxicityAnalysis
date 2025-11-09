@@ -1,4 +1,2 @@
-pyspark==3.3.0
-transformers
-torch
+pyspark==3.5.0
 kafka-python-ng 

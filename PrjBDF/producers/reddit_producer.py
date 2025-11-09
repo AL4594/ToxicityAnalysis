@@ -7,9 +7,9 @@ import sys
 # --- Configuration Reddit ---
 
 reddit = praw.Reddit(
-    client_id='pbx_UYvtwSMT6IhKABAYAw',
-    client_secret='_TxPTJKTVA_ujx8bt1Rt_rwkGaUctg',
-    user_agent='ToxicityApp'
+    client_id='tktc8C-bBDvIMTUW2YHiHw',
+    client_secret='B8LX24vYoT-phgPu1PkJy7pUHuokWg',
+    user_agent='ToxicityAppV1'
 )
 print("Connecté à l'API Reddit")
 
